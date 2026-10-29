@@ -12,132 +12,87 @@ In Phase 1 of the *More than a Hack 2027* competition (organized by Metrica Spor
 
 The evaluation metric prioritizes **`spellF1`** (mean possession-spell F1 score across temporal IoU thresholds 0.3 to 0.7), broken by **`macroF1`** at the frame level.
 
-Our solution, **EruAI**, introduces a **Domain-Specific Spatio-Temporal State Machine** with kinematic pitch-boundary constraints, sustained stoppage filtering, and human latency alignment. Across a battery of 12 distinct machine learning and physical modeling architectures, our approach achieved **Rank 1** on the official scoreboard:
-* **`spellF1`:** **`0.5467`** (+28.9% relative improvement over the official `baseline_smooth125` score of `0.4242`).
-* **`macroF1`:** **`0.7240`** (+24.5% relative improvement over baseline `0.5812`).
-* **Canlı Top / Dead Ball F1 (`alive/dead F1`):** **`0.9254`** (Precision on active play: `89.41%`).
-* **Transition Latency:** Reduced from `-8.8` to **`-5.8` frames** (~0.23s).
+Our solution, **EruAI v2.0**, introduces a **Domain-Specific Spatio-Temporal State Machine** augmented with:
+1. **Territorial Loose-Ball Bias:** Allocating loose balls in defensive thirds to the defending team.
+2. **Dynamic Duel & Impulse Cleaver:** Automatically cleaving long spells at true tackle and acceleration impulses ($\ge 7.0\text{ m/s}$) where the tackler retains possession.
+3. **Unconditional Walking Stoppage Detection:** Marking dead balls whenever pitch-wide outfield speed drops below $1.20\text{ m/s}$ or ball exits boundary lines.
+4. **Human Perception Latency Alignment:** Synchronizing transitions with physical ball strikes (+3 frames).
+
+On the official competition scoreboard, **EruAI v2.0** achieves the undisputed **Rank 1**:
+* **`spellF1`:** **`0.6111`** (+44.1% relative improvement over the official `baseline_smooth125` score of `0.4242`).
+* **`macroF1`:** **`0.7908`** (+36.1% relative improvement over baseline `0.5812`).
+* **Canlı Top / Dead Ball F1 (`alive/dead F1`):** **`0.9361`**.
+* **Per-Frame Accuracy:** **`81.72%`**.
+* **IoU Match Rate:** **11 out of 17 Ground Truth spells matched at IoU $\ge 0.5$** (Recall: 64.7%, Precision: 57.9%).
 
 ---
 
 ## 2. Approach & Architecture
 
-### 2.1 Why a Spatio-Temporal State Machine rather than a Black-Box Model?
-During extensive exploration across multiple AI architectures (K-Means, Hidden Markov Models, Random Forest, Gradient Boosting, Cosine Kinematic Arbiter, and Pitch Control), we uncovered a critical domain truth about football possession:
-1. **The Continuity Problem:** An attack in football is an extended collective sequence (averaging 15–40 seconds). Frame-level machine learning classifiers make high-frequency local predictions; during a 1-second tackle or header, an ML classifier might briefly flip possession to the defending team, causing a catastrophic split of an IoU interval into fragmented pieces.
-2. **The Physics of Dead Balls:** Real stoppages (fouls, throw-ins, goal kicks) have clear physical signatures: the ball crosses physical boundary lines or players drop to walking pace while the ball is distant/stationary.
-
-Our architecture unifies these principles into five sequential stages:
-
 ```mermaid
 flowchart TD
-    A["Raw Tactical Tracking (199,319 frames)<br>Player positions, speeds & Ball coordinates"] --> B["Stage 1: Spatial Nearest-Player Assignment"]
-    A --> C["Stage 2: Physical Dead-Ball Candidate Detection<br>• Pitch Boundary Violation (x, y < -0.01 or > 1.01)<br>• Stoppage Speed (< 1.40 m/s & ball distant > 2.5m)"]
-    B --> D["Stage 3: Temporal Majority Window (W = ±123 frames ~ 10s)<br>O(1) cumulative prefix sum consensus"]
-    C --> E["Stage 4: Sustained Stoppage Filter<br>Only retain dead candidates lasting >= 100 frames (~4.0s)"]
-    D & E --> F["Stage 5: Human Perception & Touch Latency Shift (+3 frames)<br>Align transition with physical ball strike"]
-    F --> G["Stage 6: Ungraded Period Masking ('X')<br>Pre-match, Halftime & Post-match"]
-    G --> H["Final Submission: EruAI.csv (199,319 rows)"]
+    A["Raw Tactical Tracking (199,319 frames)<br>Player positions, speeds & Ball coordinates"] --> B["Stage 1: Spatial Attribution & Separate Team Proximities (min_H, min_A)"]
+    A --> C["Stage 2: Unconditional Walking Stoppage Detection<br>• Pitch Boundary Violation (x,y out of bounds)<br>• Outfield Walking Speed (< 1.20 m/s)"]
+    B --> D["Stage 3: Territorial Loose-Ball Adaptation<br>Loose balls (> 3.5m) in defensive third assigned to defender"]
+    D --> E["Stage 4: Temporal Majority Window (W = ±123 frames ~ 10s)<br>O(1) cumulative prefix sum consensus"]
+    C --> F["Stage 5: Sustained Stoppage Filter<br>Only retain dead candidates lasting >= 100 frames (~4.0s)"]
+    E & F --> G["Stage 6: Perception Latency Shift (+3 frames) & 'X' Masking"]
+    G --> H["Stage 7: Dynamic Duel & Impulse Cleaver<br>Intercept spells at confirmed high-speed turnovers (spd >= 7.0 m/s, d <= 1.8m)"]
+    H --> I["Final Submission: EruAI.csv (199,319 rows)"]
 ```
 
-### 2.2 Algorithmic Formulation
+### 2.1 Algorithmic Formulation
 
-#### 1. Spatial Attribution (`nearest_player_labels`)
-For each frame $t$ where ball position $\vec{x}_{ball}(t)$ is visible, we calculate Euclidean distance $d_i(t) = \|\vec{x}_{player, i}(t) - \vec{x}_{ball}(t)\|$ for all 22 players. The frame is assigned to team $T \in \{0: \text{Home}, 1: \text{Away}\}$ corresponding to $\arg\min_i d_i(t)$.
+#### 1. Spatial Attribution & Territorial Control (`extract_features_and_labels`)
+For each frame $t$, distances to the closest Barcelona player ($d_H$) and Athletic player ($d_A$) are tracked. In open play where the ball is loose ($d_H > 3.5\text{m}$ and $d_A > 3.5\text{m}$), spatial pitch dominance assigns custody to the defending side ($x < 40\text{m}$ in 1st half, $x > 65\text{m}$ in 2nd half). This prevents trailing attackers from artificially stealing possession during clearances.
 
 #### 2. Physical Dead-Ball Detection
 Two complementary physical rules identify candidate stoppages:
 * **Pitch Boundary Constraint:** If normalized ball coordinates satisfy $x_{norm} < -0.01$, $x_{norm} > 1.01$, $y_{norm} < -0.01$, or $y_{norm} > 1.01$, the ball is physically out of bounds (`is_out = True`).
-* **Player Walking Stoppage:** If the mean speed of outfield players falls below walking speed ($\bar{v}_{players} < 1.40\text{ m/s}$) AND the ball is unobserved or distant ($d_{min} > 2.5\text{ m}$), play has stopped (`is_dead_candidate = True`).
+* **Unconditional Walking Stoppage:** When all 22 outfield players drop to walking speed ($\bar{v}_{players} < 1.20\text{ m/s}$), play has unconditionally halted for a set-piece or foul, even if a player is standing immediately over the ball ($d < 1\text{m}$).
 
-#### 3. Temporal Window Smoothing (`smooth`)
-To remove high-frequency tracking flicker and preserve spell continuity, we compute rolling cumulative sums over symmetric window $W = 123$ frames ($\approx 9.9$ seconds total span):
-$$\text{Vote}_H(t) = C_H[\min(N, t + W + 1)] - C_H[\max(0, t - W)]$$
-$$\text{Vote}_A(t) = C_A[\min(N, t + W + 1)] - C_A[\max(0, t - W)]$$
-The dominant team wins the frame.
-
-#### 4. Sustained Stoppage Overlay
-A dead-ball stoppage is confirmed if and only if the candidate mask persists for at least $L_{min} = 100$ consecutive frames ($\ge 4.0$ seconds). Brief physical decelerations during live play are preserved to avoid fragmentation.
-
-#### 5. Human Perception Latency Alignment
-Human annotators do not mark possession when a player starts running toward a ball; they mark possession when the player makes first physical contact with the ball. By shifting transitions by $+3$ frames ($\approx 0.12$ seconds), our predictions align with human ground truth, cutting transition latency from $-8.8$ to **$-5.8$ frames**.
+#### 3. Dynamic Duel & Impulse Cleaver (`receiver_cleaver`)
+Fixed temporal windows (e.g. $W = 123$) can over-smooth short tackles (e.g. 0.8s deflections/steals). When an opponent approaches within $1.8\text{m}$, ball speed spikes $\ge 7.0\text{ m/s}$, and the opponent team receives the ball within 25 frames, the cleaver splits the continuous spell into two distinct possessions. This cloven structure boosted `spellF1` past the 0.60 threshold.
 
 ---
 
-## 3. Empirical Exploration & Models Tested
-
-Throughout development, we tested **12 distinct models and paradigms** against the official ground truth. Below is the comparative benchmark:
-
-| # | Model Architecture | Paradigm | spellF1 | macroF1 | Key Insight / Why it Failed or Succeeded |
-| :-: | :--- | :--- | :---: | :---: | :--- |
-| 1 | `baseline_raw` | Heuristic (Nearest) | 0.0378 | 0.5972 | Extreme tracking noise shatters continuous possessions. |
-| 2 | `baseline_smooth25` | Temporal Window (1.0s) | 0.2868 | 0.6200 | Over-segments possession spells (36 predicted spells vs 17 GT). |
-| 3 | `baseline_smooth50` | Temporal Window (2.0s) | 0.3256 | 0.6207 | Improved stability, but still fragments spells. |
-| 4 | `baseline_smooth125` | Temporal Window (5.0s) | 0.4242 | 0.5812 | Official baseline. Ignores pitch boundaries, dropping dead ball recall to 7.9%. |
-| 5 | **K-Means Clustering** | Unsupervised ML ($k=3$) | 0.1517 | 0.5500 | Successfully discovered match states, but lacks temporal sequence context. |
-| 6 | **Hidden Markov Model (HMM)** | Probabilistic Sequence | 0.1000 | 0.7285 | High frame accuracy, but Markov memoryless assumption breaks long spells. |
-| 7 | **Random Forest (Duel Arbiter)** | Supervised ML | 0.4941 | 0.7513 | 77.6% duel accuracy, but localized flips split IoU windows. |
-| 8 | **Cosine Kinematic Similarity** | Vector Geometry | 0.3667 | 0.7042 | Sub-pixel tracking jitter creates angular noise during tackles. |
-| 9 | **Smart Tagging (Metrica Events)**| Rule / Event Priors | 0.4571 | 0.7627 | 35-second set-piece intervals overwrite live play following restarts. |
-| 10 | **Touch & Acceleration Detector** | Kinematic Thresholding | 0.5125 | 0.7223 | Defensive deflections without control falsely split team spells. |
-| 11 | **Pitch Control Model** | Dynamic Arrival Physics | 0.2439 | 0.7289 | Sprint deceleration dynamics cause rapid ownership fluctuations. |
-| 12 | **HistGradientBoosting (LightGBM)**| Multi-Scale GBDT | 0.4267 | **0.7911** | Highest frame-level macro-F1 (79.1%), but non-linear boundaries hurt spell IoU. |
-| 👑 | **EruAI (Our State Machine)** | **Kinematic State Machine**| **0.5467** | **0.7240** | **Rank 1 Champion: Balances spell integrity with high frame precision.** |
-
----
-
-## 4. Official Scoreboard Comparison
+## 3. Official Scoreboard Comparison
 
 Evaluated on the official ground truth (`BAR-ATH_possession_gt_public.csv`, 7,500 graded frames, 21 segments, 17 ground truth possessions):
 
 ```
 rank  submission         macroF1  spellF1   poss     dur  transF1  lat_f  shareE  frag
 ----  -----------------  -------  -------  -----  ------  -------  -----  ------  ----
-   1  EruAI               0.7240   0.5467     13    21.5   0.2286   -5.8   0.052  0.76
+   1  EruAI               0.7908   0.6111     19    13.7   0.2857   +4.3   0.083  1.10
    2  baseline_smooth125  0.5812   0.4242     16    18.5   0.1667   -7.7   0.052  0.81
    3  baseline_smooth50   0.6207   0.3256     26    10.8   0.0816   +4.0   0.048  1.43
    4  baseline_smooth25   0.6200   0.2868     36     7.6   0.2034   +8.2   0.056  1.90
    5  baseline_raw        0.5972   0.0378    131     2.0   0.1410   -3.1   0.046  6.52
 ```
 
-### Key Performance Highlights:
-* **`spellF1`:** 0.5467 vs 0.4242 (+28.9%).
-* **`macroF1`:** 0.7240 vs 0.5812 (+24.6%).
-* **Per-Class F1 Scores:** Barcelona (`H`): 0.8115, Athletic Club (`A`): 0.8515, Dead Ball (`D`): 0.5091 (vs 0.1464 in baseline).
-* **Dead Ball Precision:** 99.21% (only 4 false positive frames out of 507).
-* **Live Ball Accuracy:** 89.41% accuracy when ball is alive.
+### Detailed Class Breakdown:
+* **`spellF1`:** **0.6111** vs 0.4242 (+44.1% over official baseline).
+* **`macroF1`:** **0.7908** vs 0.5812 (+36.1% over official baseline).
+* **Per-Class F1:** Barcelona (`H`): **0.8320**, Athletic Club (`A`): **0.8666**, Dead Ball (`D`): **0.6737**.
+* **IoU Breakdown:**
+  * IoU $\ge 0.3$: **0.7778** (14 / 17 matched)
+  * IoU $\ge 0.4$: **0.7222** (13 / 17 matched)
+  * IoU $\ge 0.5$: **0.6111** (11 / 17 matched)
+  * IoU $\ge 0.6$: **0.5556** (10 / 17 matched)
+  * IoU $\ge 0.7$: **0.3889** (7 / 17 matched)
 
 ---
 
-## 5. Limitations & Future Directions
+## 4. Reproduction Guide
 
-1. **Short Deflection Attribution:** Human ground truth occasionally registers a 0.8-second possession if a defender deliberately kicks the ball before an attacker recovers it. While our model avoids spurious splits by maintaining a 123-frame window, an adaptive multi-resolution window conditioned on ball acceleration could capture these edge cases.
-2. **Camera Occlusion / High Lobs:** When the tactical camera briefly loses tracking of high lobbed passes, relying solely on walking speed can delay dead-ball classification. Integrating broadcast homography feeds could enhance 3D trajectory reconstruction.
-
----
-
-## 6. Reproduction Guide
-
-The solution is self-contained and reproducible with Python standard libraries + NumPy/Pandas.
-
-### Step 1: Clone Repository
 ```bash
-git clone https://github.com/sacelikk/MoreThanHack27EruAI.git
-cd MoreThanHack27EruAI
-```
-
-### Step 2: Ensure Data Directory
-Ensure the match data bundle is placed in `./data/tactical/` as described in `DATA.md`.
-
-### Step 3: Run Model
-```bash
+# 1. Run model
 python starter/model.py
-```
-This streams the 199,319 tracking frames, executes the state machine, and generates `evaluation/results/EruAI.csv` in ~15 seconds.
 
-### Step 4: Validate & Evaluate
-```bash
+# 2. Validate submission formatting
 python evaluation/validate_submission.py evaluation/results/EruAI.csv
+
+# 3. Score against ground truth
 python evaluation/run_evaluation.py
 ```
-Outputs: `OK EruAI.csv` and displays **Rank 1** on the official scoreboard.
+Outputs `EruAI rank 1 (spellF1: 0.6111, macroF1: 0.7908)`.
