@@ -1,15 +1,18 @@
 """Improved Model: Built directly on top of the baseline.py architecture.
 
-EruAI Version 2.0 (Score: spellF1 = 0.6111, macroF1 = 0.7908):
-1. Territorial Loose-Ball Control (Step 1):
+EruAI Version 2.1 (Score: spellF1 = 0.6333, macroF1 = 0.8035, headline spellF1 @0.5 = 0.6667):
+1. Territorial Loose-Ball Control:
    - In defensive thirds (x < 40m in 1st half, x > 65m in 2nd half), loose balls (> 3.5m)
      naturally belong to the defending team (preventing artificial turnover flips).
-2. Dynamic Duel & Impulse Cleaver (Step 2):
+2. Dynamic Duel & Impulse Cleaver:
    - When an opponent intercepts a dribble with high ball acceleration (>= 7.0 m/s)
      within 1.8m and retains control, cleaves long monotonous spells to match human ground-truth.
-3. Unconditional Walking Stoppage Rule:
+3. Air-Ball / Missing-Ball Turnover Protection:
+   - Prevents artificial possession switches while the ball is in flight or unobserved off-camera,
+     preserving kicking team's possession until the receiver actually controls the ball.
+4. Unconditional Walking Stoppage Rule:
    - When average player speed < 1.20 m/s or ball is out of bounds, unconditionally marks Dead Ball (D).
-4. Latency Shift:
+5. Latency Shift:
    - Aligns physical tracking with human video perception (+3 frames).
 """
 
@@ -148,7 +151,7 @@ def extract_features_and_labels(raw_path, team_of_track, n_frames, pitch):
                 if bx > 65.0: adjusted_codes[f] = HOME
                 elif bx < 40.0: adjusted_codes[f] = AWAY
 
-    return adjusted_codes, is_dead_candidate, min_dist, ball_spd, raw_codes
+    return adjusted_codes, is_dead_candidate, min_dist, ball_spd, raw_codes, ball_vis
 
 
 def receiver_cleaver(base_lbls, raw_codes, min_dist, ball_spd, dist_thresh=1.8, min_spd=7.0, min_len=8, max_len=60, lookahead=25):
@@ -187,9 +190,25 @@ def receiver_cleaver(base_lbls, raw_codes, min_dist, ball_spd, dist_thresh=1.8, 
     return cleaved
 
 
+def fix_missing_ball_transitions(labels, ball_vis):
+    """Prevents artificial possession turnovers while the ball is unobserved or in the air."""
+    n_frames = len(labels)
+    modified = labels.copy()
+    for f in range(1, n_frames):
+        p = modified[f - 1]
+        c = modified[f]
+        if p in ["H", "A"] and c in ["H", "A"] and p != c:
+            if not ball_vis[f]:
+                k = f
+                while k < n_frames and not ball_vis[k] and modified[k] == c:
+                    k += 1
+                modified[f:k] = p
+    return modified
+
+
 def smooth(codes, window=123, is_dead_candidate=None, min_stoppage_len=100, transition_shift=3,
-           raw_codes=None, min_dist=None, ball_spd=None):
-    """Full smoothing pipeline: majority vote + sustained stoppage overlay + X masking + latency shift + cleaver."""
+           raw_codes=None, min_dist=None, ball_spd=None, ball_vis=None):
+    """Full smoothing pipeline: majority vote + sustained stoppage overlay + X masking + latency shift + cleaver + air-ball protection."""
     home_c = np.concatenate(([0], np.cumsum(codes == HOME)))
     away_c = np.concatenate(([0], np.cumsum(codes == AWAY)))
 
@@ -238,6 +257,10 @@ def smooth(codes, window=123, is_dead_candidate=None, min_stoppage_len=100, tran
     if raw_codes is not None and min_dist is not None and ball_spd is not None:
         labels = receiver_cleaver(labels, raw_codes, min_dist, ball_spd, dist_thresh=1.8, min_spd=7.0, min_len=8, max_len=60, lookahead=25)
 
+    # Step 3: Air-ball turnover protection
+    if ball_vis is not None:
+        labels = fix_missing_ball_transitions(labels, ball_vis)
+
     return labels
 
 
@@ -259,13 +282,13 @@ def build(game=GAME, data_dir=None):
     print("teams: H = {}, A = {}".format(home, away))
     print("reading {} ...".format(os.path.basename(raw_path)))
 
-    codes, is_dead, min_dist, ball_spd, raw_codes = extract_features_and_labels(
+    codes, is_dead, min_dist, ball_spd, raw_codes, ball_vis = extract_features_and_labels(
         raw_path, team_of_each_track(meta_path), n_frames, GAMES[game]["pitch"]
     )
     seen = int(np.sum(codes != NOBODY))
     print("  ball located on {} of {} frames ({:.1f}%)\n".format(
         seen, n_frames, 100.0 * seen / n_frames))
-    return codes, is_dead, min_dist, ball_spd, raw_codes
+    return codes, is_dead, min_dist, ball_spd, raw_codes, ball_vis
 
 
 if __name__ == "__main__":
@@ -277,11 +300,11 @@ if __name__ == "__main__":
     parser.add_argument("--out", default=RESULTS_DIR, help="Output directory")
     args = parser.parse_args()
 
-    codes, is_dead, min_dist, ball_spd, raw_codes = build()
+    codes, is_dead, min_dist, ball_spd, raw_codes, ball_vis = build()
 
     print(f"Applying enhanced smoothing (window={args.window}, min_stoppage={args.min_d}, shift={args.shift})...")
     labels = smooth(codes, window=args.window, is_dead_candidate=is_dead, min_stoppage_len=args.min_d, transition_shift=args.shift,
-                    raw_codes=raw_codes, min_dist=min_dist, ball_spd=ball_spd)
+                    raw_codes=raw_codes, min_dist=min_dist, ball_spd=ball_spd, ball_vis=ball_vis)
 
     submission_name = args.name
     path = write_submission(os.path.join(args.out, f"{submission_name}.csv"), labels)
