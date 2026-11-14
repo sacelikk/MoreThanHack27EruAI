@@ -187,11 +187,15 @@ def extract_features_and_labels(raw_path, team_of_track, n_frames, pitch):
                 if bx > 65.0: adjusted_codes[f] = HOME
                 elif bx < 40.0: adjusted_codes[f] = AWAY
 
-    return adjusted_codes, is_dead_candidate, min_dist, ball_spd, raw_codes, ball_vis
+    return adjusted_codes, is_dead_candidate, min_dist, ball_spd, raw_codes, ball_vis, ball_xy
 
 
-def receiver_cleaver(base_lbls, raw_codes, min_dist, ball_spd, dist_thresh=1.8, min_spd=7.0, min_len=8, max_len=60, lookahead=25, pad_pre=6, pad_post=0):
-    """Step 2: Cleaves long continuous spells at true duel / tackle moments with physical contact expansion."""
+def receiver_cleaver(base_lbls, raw_codes, min_dist, ball_spd, ball_xy=None, dist_thresh=1.8, min_spd=7.0,
+                     min_len=8, max_len=60, lookahead=25, pad_pre=6, pad_post=0, penalty_box=20.0):
+    """Step 2: Cleaves long continuous spells at true duel / tackle moments with physical contact expansion.
+    Defending Box Invariance: Challenges inside the defending team's penalty box do not flip possession
+    without a confirmed attacking pass/receiver (prevents false turnovers from clearance deflections).
+    """
     n_frames = len(base_lbls)
     cleaved = base_lbls.copy()
     i = 0
@@ -216,7 +220,18 @@ def receiver_cleaver(base_lbls, raw_codes, min_dist, ball_spd, dist_thresh=1.8, 
                         if min_dist[k] <= 2.0:
                             receiver = raw_codes[k]
                             break
-                    if receiver == opp_code or receiver is None:
+
+                    in_defending_box = False
+                    if ball_xy is not None:
+                        bx = ball_xy[i, 0]
+                        if i < 100000:
+                            if curr_lbl == "H" and bx < penalty_box: in_defending_box = True
+                            elif curr_lbl == "A" and bx > (105.3 - penalty_box): in_defending_box = True
+                        else:
+                            if curr_lbl == "H" and bx > (105.3 - penalty_box): in_defending_box = True
+                            elif curr_lbl == "A" and bx < penalty_box: in_defending_box = True
+
+                    if not in_defending_box and (receiver == opp_code or receiver is None):
                         # Physical contact pre-padding: defender initiates tackle ~0.24s before peak impulse
                         p_start = max(0, i - pad_pre)
                         p_end = min(n_frames, j + pad_post)
@@ -249,7 +264,7 @@ def fix_missing_ball_transitions(labels, ball_vis):
 
 
 def smooth(codes, window=123, is_dead_candidate=None, min_stoppage_len=100, transition_shift=3,
-           raw_codes=None, min_dist=None, ball_spd=None, ball_vis=None, pad_pre=6):
+           raw_codes=None, min_dist=None, ball_spd=None, ball_vis=None, ball_xy=None, pad_pre=6, penalty_box=20.0):
     """Full smoothing pipeline: majority vote + sustained stoppage overlay + X masking + latency shift + cleaver + air-ball protection."""
     home_c = np.concatenate(([0], np.cumsum(codes == HOME)))
     away_c = np.concatenate(([0], np.cumsum(codes == AWAY)))
@@ -295,9 +310,10 @@ def smooth(codes, window=123, is_dead_candidate=None, min_stoppage_len=100, tran
         shifted[orig_d_or_x] = labels[orig_d_or_x]
         labels = shifted
 
-    # Step 2: Dynamic duel cleaver with physical contact pre-padding
+    # Step 2: Dynamic duel cleaver with physical contact pre-padding & defending box invariance
     if raw_codes is not None and min_dist is not None and ball_spd is not None:
-        labels = receiver_cleaver(labels, raw_codes, min_dist, ball_spd, dist_thresh=1.8, min_spd=7.0, min_len=8, max_len=60, lookahead=25, pad_pre=pad_pre)
+        labels = receiver_cleaver(labels, raw_codes, min_dist, ball_spd, ball_xy=ball_xy, dist_thresh=1.8, min_spd=7.0,
+                                  min_len=8, max_len=60, lookahead=25, pad_pre=pad_pre, penalty_box=penalty_box)
 
     # Step 3: Air-ball turnover protection
     if ball_vis is not None:
@@ -324,13 +340,13 @@ def build(game=GAME, data_dir=None):
     print("teams: H = {}, A = {}".format(home, away))
     print("reading {} ...".format(os.path.basename(raw_path)))
 
-    codes, is_dead, min_dist, ball_spd, raw_codes, ball_vis = extract_features_and_labels(
+    codes, is_dead, min_dist, ball_spd, raw_codes, ball_vis, ball_xy = extract_features_and_labels(
         raw_path, team_of_each_track(meta_path), n_frames, GAMES[game]["pitch"]
     )
     seen = int(np.sum(codes != NOBODY))
     print("  ball located on {} of {} frames ({:.1f}%)\n".format(
         seen, n_frames, 100.0 * seen / n_frames))
-    return codes, is_dead, min_dist, ball_spd, raw_codes, ball_vis
+    return codes, is_dead, min_dist, ball_spd, raw_codes, ball_vis, ball_xy
 
 
 if __name__ == "__main__":
@@ -339,15 +355,17 @@ if __name__ == "__main__":
     parser.add_argument("--min-d", type=int, default=100, help="Minimum sustained dead ball length (default: 100)")
     parser.add_argument("--shift", type=int, default=3, help="Transition latency shift (default: 3)")
     parser.add_argument("--pad-pre", type=int, default=6, help="Physical contact pre-padding frames (default: 6)")
+    parser.add_argument("--penalty-box", type=float, default=20.0, help="Defending penalty box boundary in meters (default: 20.0)")
     parser.add_argument("--name", default="EruAI", help="Submission name (default: EruAI)")
     parser.add_argument("--out", default=RESULTS_DIR, help="Output directory")
     args = parser.parse_args()
 
-    codes, is_dead, min_dist, ball_spd, raw_codes, ball_vis = build()
+    codes, is_dead, min_dist, ball_spd, raw_codes, ball_vis, ball_xy = build()
 
-    print(f"Applying enhanced smoothing (window={args.window}, min_stoppage={args.min_d}, shift={args.shift}, pad_pre={args.pad_pre})...")
+    print(f"Applying enhanced smoothing (window={args.window}, min_stoppage={args.min_d}, shift={args.shift}, pad_pre={args.pad_pre}, penalty_box={args.penalty_box})...")
     labels = smooth(codes, window=args.window, is_dead_candidate=is_dead, min_stoppage_len=args.min_d, transition_shift=args.shift,
-                    raw_codes=raw_codes, min_dist=min_dist, ball_spd=ball_spd, ball_vis=ball_vis, pad_pre=args.pad_pre)
+                    raw_codes=raw_codes, min_dist=min_dist, ball_spd=ball_spd, ball_vis=ball_vis, ball_xy=ball_xy, pad_pre=args.pad_pre,
+                    penalty_box=args.penalty_box)
 
     # Write both EruAI.csv and my_submission.csv
     for s_name in [args.name, "my_submission"]:
